@@ -52,13 +52,15 @@ func ParseGrpcPayload(data []byte) ([]byte, error) {
 }
 
 // ParseGrpcPayloads extracts the message payload of every gRPC frame in data.
-// A streamed response can deliver several frames in one body chunk.
+// A streamed response can deliver several frames in one body chunk. When a
+// frame cannot be parsed, the payloads of the frames before it are returned
+// together with the error, so a caller can still read them.
 func ParseGrpcPayloads(data []byte) ([][]byte, error) {
 	var payloads [][]byte
 	for len(data) > 0 {
 		payload, err := ParseGrpcPayload(data)
 		if err != nil {
-			return nil, err
+			return payloads, err
 		}
 		payloads = append(payloads, payload)
 		data = data[gRPCPayloadHeaderLen+len(payload):]

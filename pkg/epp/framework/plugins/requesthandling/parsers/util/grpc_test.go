@@ -128,8 +128,9 @@ func TestParseGrpcPayloads(t *testing.T) {
 			want: [][]byte{[]byte("hello"), []byte("world")},
 		},
 		{
-			name:    "incomplete trailing frame",
+			name:    "incomplete trailing frame keeps the frames before it",
 			data:    append(frame("hello"), frame("world")[:8]...),
+			want:    [][]byte{[]byte("hello")},
 			wantErr: "incomplete gRPC payload: header indicates 5 bytes, but only 3 bytes are available",
 		},
 	}
@@ -145,9 +146,7 @@ func TestParseGrpcPayloads(t *testing.T) {
 				if gotErr := err.Error(); gotErr != tt.wantErr {
 					t.Errorf("got error %q, want %q", gotErr, tt.wantErr)
 				}
-				return
-			}
-			if err != nil {
+			} else if err != nil {
 				t.Fatalf("got error %v, want nil", err)
 			}
 			if diff := cmp.Diff(tt.want, got); diff != "" {

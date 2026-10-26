@@ -19,6 +19,7 @@ package vertexai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"strings"
@@ -134,27 +135,32 @@ func (p *VertexAIParser) ParseRequest(ctx context.Context, body []byte, headers 
 // ParseResponse parses the response body and returns a ParsedResponse. A body
 // chunk carries one or more gRPC frames, each wrapping an HttpBody whose
 // content_type names the media type of its data, so the OpenAI parser reads the
-// data under that type rather than under the gRPC transport's.
+// data under that type rather than under the gRPC transport's. Parsing is best
+// effort: a frame that cannot be read is reported in the returned error while
+// the usage of the frames that can is still returned.
 func (p *VertexAIParser) ParseResponse(ctx context.Context, body []byte, headers map[string]string, endOfStream bool) (*fwkrh.ParsedResponse, error) {
 	if len(body) == 0 {
 		// Nothing to parse
 		return nil, nil //nolint:nilnil
 	}
 
+	var errs []error
 	payloads, err := grpcutil.ParseGrpcPayloads(body)
 	if err != nil {
-		return nil, fmt.Errorf("parsing gRPC response payload: %w", err)
+		errs = append(errs, fmt.Errorf("parsing gRPC response payload: %w", err))
 	}
 
 	var result *fwkrh.ParsedResponse
 	for _, payload := range payloads {
 		respMsg := &httpbody.HttpBody{}
 		if err := proto.Unmarshal(payload, respMsg); err != nil {
-			return nil, fmt.Errorf("unmarshaling HttpBody response: %w", err)
+			errs = append(errs, fmt.Errorf("unmarshaling HttpBody response: %w", err))
+			continue
 		}
 		parsed, err := p.openAIParser.ParseResponse(ctx, respMsg.GetData(), bodyHeaders(headers, respMsg.GetContentType()), endOfStream)
 		if err != nil {
-			return nil, err
+			errs = append(errs, err)
+			continue
 		}
 		if parsed == nil {
 			continue
@@ -167,7 +173,7 @@ func (p *VertexAIParser) ParseResponse(ctx context.Context, body []byte, headers
 		}
 		result.StreamedEvents += parsed.StreamedEvents
 	}
-	return result, nil
+	return result, errors.Join(errs...)
 }
 
 // bodyHeaders returns headers with the content type an HttpBody declares for its
