@@ -56,11 +56,13 @@ const (
 // chat completions requests when s.config.DecodeChunkSize > 0.
 // body is the already-parsed JSON map; callers that hold it
 // should use this instead of calling s.decoderProxy directly.
-func (s *Server) dispatchDecode(w http.ResponseWriter, r *http.Request, body map[string]any) {
+// raw supplies regular-decode bytes without rereading the request body.
+func (s *Server) dispatchDecode(w http.ResponseWriter, r *http.Request, body map[string]any, raw []byte, toolFields *toolCallingRequest) {
 	if s.config.DecodeChunkSize > 0 && r.URL.Path == reqcommon.PathChatCompletions {
-		s.runChunkedDecodeFromMap(w, r, body)
+		s.runChunkedDecodeFromMap(w, r, body, raw, toolFields)
 		return
 	}
+	toolFields.compareValidatedDispatchedForSpan(raw, trace.SpanFromContext(r.Context()))
 	s.decoderProxy.ServeHTTP(w, r)
 }
 
@@ -72,19 +74,45 @@ func (s *Server) runChunkedDecode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.runChunkedDecodeFromMap(w, cloneRequestWithBody(r.Context(), r, original), body)
+	toolFields, _ := captureInferenceToolCallingRequest(r, reqcommon.APITypeChatCompletions, original)
+	defer toolFields.report(r.Context())
+	s.runChunkedDecodeFromMap(w, cloneRequestWithBody(r.Context(), r, original), body, original, toolFields)
 }
 
 // runChunkedDecodeFromMap executes chunked decode given an already-parsed body map.
 // Non-streaming: accumulated chunks are reassembled into a single JSON response.
 // Streaming: each chunk is re-emitted as an SSE event; [DONE] closes the stream.
-func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request, body map[string]any) {
+// The caller owns aggregate reporting across prefill and decode chunks.
+func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request, body map[string]any, raw []byte, toolFields *toolCallingRequest) {
 	s.logger.V(logging.DEBUG).Info("running chunked decode", "chunkSize", s.config.DecodeChunkSize)
 
 	ctx, span := tracing.Tracer(tracerScope).Start(r.Context(), "chunked_decode",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	defer span.End()
+	// Chunk outcomes exclude prefill results held by the request aggregate.
+	var chunkFields *toolCallingRequest
+	if toolFields != nil && span.IsRecording() {
+		chunkFields = &toolCallingRequest{original: toolFields.original}
+		defer func() {
+			if len(chunkFields.statuses) == 0 {
+				return
+			}
+			attrs := chunkFields.original.SpanAttributes(chunkFields.statuses)
+			span.SetAttributes(attrs...)
+			trace.SpanFromContext(r.Context()).SetAttributes(attrs...)
+		}()
+	}
+	compareChunk := func(raw []byte) {
+		statuses, err := toolFields.compareValidatedDispatched(raw)
+		if chunkFields != nil && err == nil {
+			chunkFields.mergeStatuses(statuses)
+		}
+	}
+	regularDecode := func() {
+		compareChunk(raw)
+		s.decoderProxy.ServeHTTP(w, r.WithContext(ctx))
+	}
 
 	streamingEnabled, _ := body[reqcommon.FieldStream].(bool)
 	originalMaxTokens := resolveMaxTokens(body)
@@ -97,14 +125,14 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 	// The decoder echoes the final assistant message, which under chunking is the text of all earlier chunks.
 	if echo, _ := body[reqcommon.FieldEcho].(bool); echo {
 		s.logger.V(logging.DEBUG).Info("chunked decode: echo enabled, using regular decode")
-		s.decoderProxy.ServeHTTP(w, r)
+		regularDecode()
 		return
 	}
 
 	// Each chunk continues the first choice's text for every choice, and the budget counts the tokens of all choices.
 	if n, ok := toInt(body[requestFieldN]); ok && n > 1 {
 		s.logger.V(logging.DEBUG).Info("chunked decode: several choices requested, using regular decode", "n", n)
-		s.decoderProxy.ServeHTTP(w, r)
+		regularDecode()
 		return
 	}
 
@@ -115,7 +143,7 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 	// without re-encoding them.
 	if requestMayCallTools(body) {
 		s.logger.V(logging.DEBUG).Info("chunked decode: tools requested, using regular decode")
-		s.decoderProxy.ServeHTTP(w, r)
+		regularDecode()
 		return
 	}
 
@@ -123,13 +151,13 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 	if originalMaxTokens > 0 && originalMaxTokens <= s.config.DecodeChunkSize {
 		s.logger.V(logging.DEBUG).Info("chunked decode: token budget <= chunk size, using regular decode",
 			"maxTokens", originalMaxTokens, "chunkSize", s.config.DecodeChunkSize)
-		s.decoderProxy.ServeHTTP(w, r)
+		regularDecode()
 		return
 	}
 
 	messages, err := requestMessages(body)
 	if err != nil {
-		s.decoderProxy.ServeHTTP(w, r)
+		regularDecode()
 		return
 	}
 	finalMessage := map[string]json.RawMessage{reqcommon.FieldRole: json.RawMessage(`"` + roleAssistant + `"`)}
@@ -140,13 +168,13 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 		// Only an assistant message can carry the accumulated text; any other final message is sent as is.
 		if len(messages) == 0 || json.Unmarshal(messages[len(messages)-1], &finalMessage) != nil ||
 			json.Unmarshal(finalMessage[reqcommon.FieldRole], &role) != nil || role != roleAssistant {
-			s.decoderProxy.ServeHTTP(w, r)
+			regularDecode()
 			return
 		}
 		content := finalMessage[reqcommon.FieldContent]
 		// Content parts arrays and null have no string to extend.
 		if len(content) == 0 || content[0] != '"' || json.Unmarshal(content, &prefix) != nil {
-			s.decoderProxy.ServeHTTP(w, r)
+			regularDecode()
 			return
 		}
 		messages = messages[:len(messages)-1]
@@ -227,6 +255,7 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 			"chunk", chunkIndex, "chunkBudget", chunkBudget, "totalTokensSoFar", totalTokens)
 
 		bw := &bufferedResponseWriter{}
+		compareChunk(chunkBody)
 		s.decoderProxy.ServeHTTP(bw, cloneRequestWithBody(ctx, r, chunkBody))
 
 		if isHTTPError(bw.statusCode) {
@@ -235,13 +264,19 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 			span.SetStatus(codes.Error, "chunk decode failed")
 			maps.Copy(w.Header(), bw.headers)
 			w.WriteHeader(bw.statusCode)
+			if streamingEnabled && chunkIndex > 0 {
+				// The status went out with the first chunk, so the error is sent the
+				// way vLLM reports a failure in a stream: as a data event before [DONE].
+				fmt.Fprintf(w, "%s%s\n\n%s\n\n", reqcommon.SSEDataPrefix, bw.bodyBytes(), reqcommon.SSEDone)
+				return
+			}
 			WriteAll(w, bw.bodyBytes())
 			return
 		}
 
 		var chunkResponse map[string]any
 		if err := json.Unmarshal(bw.bodyBytes(), &chunkResponse); err != nil {
-			s.logger.Error(err, "failed to unmarshal chunk response", "chunk", chunkIndex)
+			s.logger.Error(jsonErrorForLog(err), "failed to unmarshal chunk response", "chunk", chunkIndex)
 			if err := errorInternalServerError(err, w); err != nil {
 				s.logger.Error(err, "failed to send error response to client")
 			}
@@ -263,8 +298,14 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 		// Accumulated text forms the assistant message for the next chunk.
 		textAccum.WriteString(chunkText)
 
+		terminal := finishReason != "" && finishReason != finishReasonLength
+		// Guard against infinite loop: if the chunk produced no tokens and no
+		// text there is nothing to continue from.
+		empty := chunkTokens == 0 && chunkText == ""
+
 		if streamingEnabled {
-			if err := emitSSEChunk(w, chunkResponse); err != nil {
+			last := terminal || empty || remainingTokens(originalMaxTokens, totalTokens) == 0
+			if err := emitSSEChunk(w, chunkResponse, last); err != nil {
 				s.logger.Error(err, "failed to write SSE chunk to client")
 				return
 			}
@@ -273,21 +314,19 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 			}
 		}
 
-		if finishReason != "" && finishReason != finishReasonLength {
+		if terminal {
 			s.logger.V(logging.DEBUG).Info("chunked decode: terminal finish reason, stopping",
 				"finishReason", finishReason, "chunks", chunkIndex)
 			break
 		}
 
-		// Guard against infinite loop: if the chunk produced no tokens and no
-		// text there is nothing to continue from.
-		if chunkTokens == 0 && chunkText == "" {
+		if empty {
 			s.logger.Info("chunked decode: empty chunk with no tokens, stopping to avoid infinite loop",
 				"chunk", chunkIndex)
 			break
 		}
 
-		s.logger.V(logging.TRACE).Info("chunked decode: appending chunk text to request", "chunkText", chunkText)
+		s.logger.V(logging.TRACE).Info("chunked decode: appending chunk text to request", "chunkTextBytes", len(chunkText))
 	}
 
 	span.SetAttributes(
@@ -333,8 +372,8 @@ func (s *Server) runChunkedDecodeFromMap(w http.ResponseWriter, r *http.Request,
 
 	lastResponse[reqcommon.FieldUsage] = cumulativeUsage
 
-	if choices, ok := lastResponse[responseFieldChoices].([]any); ok && len(choices) > 0 {
-		choice := maps.Clone(choices[0].(map[string]any))
+	if choice := firstChoice(lastResponse); choice != nil {
+		choice = maps.Clone(choice)
 		fullText := textAccum.String()
 		if msg, ok := choice[responseFieldMessage].(map[string]any); ok {
 			msg = maps.Clone(msg)
@@ -418,10 +457,12 @@ func extractFinishReason(response map[string]any) string {
 }
 
 // emitSSEChunk writes one SSE data event to w, converting a buffered
-// non-streaming response into a streaming delta event. The delta carries
-// the message's content and reasoning, and the choice's logprobs pass
-// through, so a streaming client receives what the decoder returned.
-func emitSSEChunk(w http.ResponseWriter, chunkResponse map[string]any) error {
+// non-streaming response into a streaming delta event (chat or legacy). The
+// delta carries the message's content and reasoning, and the choice's logprobs
+// pass through, so a streaming client receives what the decoder returned.
+// Unless last is set, finish_reason is null: the decoder stopped that chunk at
+// its chunk budget, and the next chunk continues the response.
+func emitSSEChunk(w http.ResponseWriter, chunkResponse map[string]any, last bool) error {
 	streamChunk := maps.Clone(chunkResponse)
 
 	if choices, _ := chunkResponse[responseFieldChoices].([]any); len(choices) > 0 {
@@ -433,8 +474,11 @@ func emitSSEChunk(w http.ResponseWriter, chunkResponse map[string]any) error {
 			}
 			streamChoice := map[string]any{
 				responseFieldIndex:        choice[responseFieldIndex],
-				responseFieldFinishReason: choice[responseFieldFinishReason],
+				responseFieldFinishReason: nil,
 				responseFieldDelta:        deltaFromChoice(choice),
+			}
+			if last {
+				streamChoice[responseFieldFinishReason] = choice[responseFieldFinishReason]
 			}
 			if logprobs, ok := choice[responseFieldLogprobs]; ok && logprobs != nil {
 				streamChoice[responseFieldLogprobs] = logprobs

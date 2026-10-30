@@ -91,6 +91,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/globalstrict"
 	programaware "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/program-aware"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/roundrobin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/weightedfairshare"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/ordering/edf"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/ordering/fcfs"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/ordering/slodeadline"
@@ -127,11 +128,13 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/passthrough"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/sglanghttp"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/systemone"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/vertexai"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/vllmgrpc"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/vllmhttp"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	endpointattributefilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/endpointattribute"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/endpointhealth"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/prefixcacheaffinity"
 	sessionaffinityfilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sloheadroomtier"
@@ -153,6 +156,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/latencyobservation"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/loadaware"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/loraaffinity"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/loraresidency"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/mmcacheaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/nohitlru"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/prefix"
@@ -467,7 +471,7 @@ func (r *Runner) setup(ctx, servingCtx context.Context, cfg *rest.Config, opts *
 	// --- Setup Metrics Server ---
 	metricsutil.SetFairnessIDLabelLimit(opts.FairnessIDMetricLabelLimit)
 	r.customCollectors = append(r.customCollectors, collectors.NewInferencePoolMetricsCollector(ds))
-	metrics.Register(r.customCollectors...)
+	metrics.RegisterWithOptions(metricsRegisterOptions(rawConfig), r.customCollectors...)
 	metrics.RecordInferenceExtensionInfo(version.CommitSHA, version.BuildRef)
 	// Register metrics handler.
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
@@ -587,6 +591,22 @@ func (r *Runner) setup(ctx, servingCtx context.Context, cfg *rest.Config, opts *
 	return mgr, ds, nil
 }
 
+// metricsRegisterOptions maps the configuration file's metrics section onto the
+// metrics package. Both discovery paths call it with the same parsed config, and
+// both call it before registration because the histograms are built there and
+// are process-wide. The edges themselves are validated with the rest of the
+// configuration in pkg/epp/config/loader, so startup has already failed by here
+// if they are unusable.
+func metricsRegisterOptions(rawConfig *configapiv1.EndpointPickerConfig) metrics.RegisterOptions {
+	if rawConfig == nil || rawConfig.Metrics == nil {
+		return metrics.RegisterOptions{}
+	}
+	return metrics.RegisterOptions{
+		RequestTPOTBuckets: rawConfig.Metrics.RequestTPOTBuckets,
+		RequestITLBuckets:  rawConfig.Metrics.RequestITLBuckets,
+	}
+}
+
 // newMetricsServerOptions configures the EPP metrics server. OpenMetrics is
 // enabled because exemplars only exist in that format.
 func newMetricsServerOptions(port uint16, authEnabled bool) metricsserver.Options {
@@ -648,7 +668,8 @@ func setupDatastore(ctx context.Context, epFactory datalayer.EndpointFactory,
 func (r *Runner) registerInTreePlugins() {
 	// request control screeners
 	// Alpha
-	fwkplugin.Register(disaggregatedsetrollout.PluginType, fwkplugin.StabilityAlpha, disaggregatedsetrollout.Factory)
+	fwkplugin.RegisterWithPluginDependencies(disaggregatedsetrollout.PluginType, fwkplugin.StabilityAlpha,
+		disaggregatedsetrollout.Factory, disaggregatedsetrollout.ConfigParser)
 	fwkplugin.Register(endpointpin.PluginType, fwkplugin.StabilityAlpha, endpointpin.Factory)
 
 	// request control pre-request handlers
@@ -671,6 +692,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(endpointattributefilter.EndpointAttributeFilterType, fwkplugin.StabilityAlpha, endpointattributefilter.EndpointAttributeFilterFactory)
 	fwkplugin.Register(topologyaffinityfilter.FilterType, fwkplugin.StabilityAlpha, topologyaffinityfilter.Factory)
 	fwkplugin.Register(utilizationfilter.UtilizationFilterType, fwkplugin.StabilityAlpha, utilizationfilter.Factory)
+	fwkplugin.Register(endpointhealth.EndpointHealthFilterType, fwkplugin.StabilityAlpha, endpointhealth.Factory)
 
 	// extra scheduling scorers
 	// Beta
@@ -730,6 +752,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(burstprefix.PluginType, fwkplugin.StabilityAlpha, burstprefix.Factory)
 	fwkplugin.Register(p2psource.PluginType, fwkplugin.StabilityAlpha, p2psource.PluginFactory)
 	fwkplugin.Register(selectivekv.PluginType, fwkplugin.StabilityAlpha, selectivekv.PluginFactory)
+	fwkplugin.Register(loraresidency.Type, fwkplugin.StabilityAlpha, loraresidency.Factory)
 	// multicluster variants
 	fwkplugin.Register(sessionaffinityfilter.MultiClusterFilterType, fwkplugin.StabilityAlpha, sessionaffinityfilter.MultiClusterFactory)
 	fwkplugin.Register(queuedepth.MultiClusterScorerType, fwkplugin.StabilityAlpha, queuedepth.MultiClusterScorerFactory)
@@ -752,6 +775,7 @@ func (r *Runner) registerInTreePlugins() {
 	// Alpha
 	fwkplugin.Register(evictfiltering.SheddableFilterType, fwkplugin.StabilityAlpha, evictfiltering.SheddableFilterFactory)
 	fwkplugin.Register(evictordering.PriorityThenTimeOrderingType, fwkplugin.StabilityAlpha, evictordering.PriorityThenTimeOrderingFactory)
+	fwkplugin.Register(weightedfairshare.WeightedFairShareFairnessPolicyType, fwkplugin.StabilityAlpha, weightedfairshare.WeightedFairShareFairnessPolicyFactory)
 	fwkplugin.Register(softreflectiveceiling.PolicyType, fwkplugin.StabilityAlpha, softreflectiveceiling.Factory)
 
 	// Register Request level data producer plugins as defaults for their respective data keys.
@@ -806,6 +830,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(passthrough.PassthroughParserType, fwkplugin.StabilityBeta, passthrough.PassthroughParserPluginFactory)
 	fwkplugin.Register(anthropic.AnthropicParserType, fwkplugin.StabilityBeta, anthropic.AnthropicParserPluginFactory)
 	fwkplugin.Register(vllmhttp.VllmHTTPParserType, fwkplugin.StabilityBeta, vllmhttp.VllmHTTPParserPluginFactory)
+	fwkplugin.Register(systemone.SystemOneParserType, fwkplugin.StabilityBeta, systemone.SystemOneParserPluginFactory)
 	fwkplugin.Register(sglanghttp.SGLangHTTPParserType, fwkplugin.StabilityBeta, sglanghttp.SGLangHTTPParserPluginFactory)
 	fwkplugin.Register(vertexai.VertexAIParserType, fwkplugin.StabilityBeta, vertexai.VertexAIParserPluginFactory)
 
@@ -898,6 +923,9 @@ func (r *Runner) parseConfigurationPhaseTwo(ctx context.Context, rawConfig *conf
 	}
 
 	r.schedulerConfig = cfg.SchedulerConfig
+
+	pollStatus := datalayer.NewPollStatusProducer(cfg.DataConfig)
+	handle.AddPlugin(pollStatus.TypedName().Name, pollStatus)
 
 	// Auto-create any DataProducer plugins that are needed by consumers already in
 	// the config but not yet satisfied by an existing producer.
@@ -996,6 +1024,9 @@ func validateKubernetesDiscoveryFlags(opts *runserver.Options) error {
 	}
 	if opts.PoolName == "" && opts.EndpointSelector == nil {
 		return errors.New("either pool-name or endpoint-selector must be set")
+	}
+	if opts.ObjectivesFile != "" {
+		return errors.New("objectives-file requires file discovery")
 	}
 	return nil
 }
@@ -1206,6 +1237,11 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 	}
 	pool := datalayer.NewEndpointPool(namespace, poolName)
 	ds := datastore.NewDatastore(r.servingCtx, epf).WithEndpointPool(pool)
+	objectivePriorities, err := loadObjectivesFile(opts.ObjectivesFile, ds)
+	if err != nil {
+		setupLog.Error(err, "Failed to load objectives file", "path", opts.ObjectivesFile)
+		return err
+	}
 
 	// On bare metal / Slurm / Ray (or any deployment without the K8s Downward
 	// API), neither --pool-namespace nor the NAMESPACE env var is set, so the
@@ -1227,7 +1263,7 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 	// Surface this once at startup so operators porting a K8s config see why
 	// related behavior differs.
 	//
-	// Note on InferenceObjective: with no objective CRDs to consult, per-request
+	// Note on InferenceObjective: without --objectives-file, per-request
 	// priority falls back to Director.defaultPriority (see
 	// pkg/epp/requestcontrol/director.go). Static priority bands configured in
 	// EndpointPickerConfig.flowControl are honored and applied via the FlowControl
@@ -1264,15 +1300,14 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 
 	scheduler := scheduling.NewSchedulerWithConfig(r.schedulerConfig)
 
-	// Outside Kubernetes there is no InferenceObjective CRD, so per-request
-	// priority falls back to Director.defaultPriority (see
-	// pkg/epp/requestcontrol/director.go); static bands defined in
-	// EndpointPickerConfig.flowControl still apply.
+	// Per-request priority comes from --objectives-file; a request whose
+	// objective is not loaded gets Director.defaultPriority.
 	endpointCandidates := contracts.EndpointCandidates(requestcontrol.NewDatastoreEndpointCandidates(ds,
 		requestcontrol.WithDisableEndpointSubsetFilter(opts.DisableEndpointSubsetFilter)))
-	// File-discovery mode has no InferenceObjective reconciler to drive the
-	// control plane; static bands from config apply at registry construction.
-	endpointCandidates, admissionController, _, requestEvictor := r.initAdmissionControl(r.servingCtx, opts, eppConfig, endpointCandidates)
+	// Static bands from config apply at registry construction; --objectives-file
+	// bands are provisioned here, before the server starts serving.
+	endpointCandidates, admissionController, bandControlPlane, requestEvictor := r.initAdmissionControl(r.servingCtx, opts, eppConfig, endpointCandidates)
+	provisionObjectiveBands(bandControlPlane, objectivePriorities)
 	director := requestcontrol.NewDirectorWithConfig(ds, scheduler, admissionController, endpointCandidates, r.requestControlConfig)
 	if requestEvictor != nil {
 		director.SetRequestEvictor(requestEvictor)
@@ -1293,7 +1328,7 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 	}
 
 	r.customCollectors = append(r.customCollectors, collectors.NewInferencePoolMetricsCollector(ds))
-	metrics.Register(r.customCollectors...)
+	metrics.RegisterWithOptions(metricsRegisterOptions(rawConfig), r.customCollectors...)
 	metrics.RecordInferenceExtensionInfo(version.CommitSHA, version.BuildRef)
 
 	setupLog.Info("EPP starting (file discovery mode)",

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"mime/multipart"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1364,7 +1365,7 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				t.Errorf("ParseRequest() got.SkipResponseProcessing = %v, want false", got.SkipResponseProcessing)
 			}
 
-			if tt.want.Completions != nil || tt.want.ChatCompletions != nil {
+			if rawFields := wantEnvelopeRawFields(tt.want); rawFields != nil {
 				tt.want.RawBody = bodyBytes
 				payload, _ := tt.want.Payload.AsMap()
 				for key, value := range payload {
@@ -1372,7 +1373,7 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if key == promptField || raw[0] == '{' || raw[0] == '[' {
+					if slices.Contains(rawFields, key) || raw[0] == '{' || raw[0] == '[' {
 						payload[key] = json.RawMessage(raw)
 					}
 				}
@@ -1384,6 +1385,19 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 				t.Errorf("ParseRequest() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// wantEnvelopeRawFields returns the string fields an envelope-only payload keeps
+// opaque for the API the expected body belongs to, or nil for a fully decoded payload.
+func wantEnvelopeRawFields(want *fwkrh.InferenceRequestBody) []string {
+	switch {
+	case want.Responses != nil:
+		return envelopeRawFields[responsesAPI]
+	case want.Completions != nil || want.ChatCompletions != nil:
+		return envelopeRawFields[chatCompletionsAPI]
+	default:
+		return nil
 	}
 }
 
@@ -1969,6 +1983,30 @@ func TestOpenAIParser_ParseResponse_Streaming(t *testing.T) {
 			chunk: []byte("event: response.in_progress\ndata: {\"response\":{\"usage\":{\"input_tokens\":31,\"output_tokens\":3}},\"type\":\"response.in_progress\"}"),
 			want: &fwkrh.ParsedResponse{
 				Usage:          nil,
+				StreamedEvents: 1,
+			},
+		},
+		{
+			name:  "ResponsesAPI incomplete terminal event carries usage",
+			chunk: []byte("event: response.incomplete\ndata: {\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"total_tokens\":13}},\"type\":\"response.incomplete\"}"),
+			want: &fwkrh.ParsedResponse{
+				Usage: &fwkrh.Usage{
+					PromptTokens:     10,
+					CompletionTokens: 3,
+					TotalTokens:      13,
+				},
+				StreamedEvents: 1,
+			},
+		},
+		{
+			name:  "ResponsesAPI failed terminal event carries usage",
+			chunk: []byte("event: response.failed\ndata: {\"response\":{\"status\":\"failed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"total_tokens\":10}},\"type\":\"response.failed\"}"),
+			want: &fwkrh.ParsedResponse{
+				Usage: &fwkrh.Usage{
+					PromptTokens:     10,
+					CompletionTokens: 0,
+					TotalTokens:      10,
+				},
 				StreamedEvents: 1,
 			},
 		},
